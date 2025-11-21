@@ -1,0 +1,7 @@
+streamlit
+pandas
+requests
+gspread
+oauth2client
+apify-client
+openai
