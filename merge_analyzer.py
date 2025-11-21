@@ -105,9 +105,11 @@ def get_yt_channel_id(handle, api_key):
         pass
     return None
 
-def get_yt_shorts(channel_id, api_key, days_ago=30):
+def get_yt_shorts(channel_id, api_key, days_ago):
+    # Calculate cutoff date based on days_ago
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_ago)
     published_after = cutoff_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+    
     url = "https://youtube.googleapis.com/youtube/v3/search"
     params = {
         "key": api_key, "channelId": channel_id, "part": "snippet,id",
@@ -137,7 +139,7 @@ def get_yt_shorts(channel_id, api_key, days_ago=30):
     except Exception as e:
         return []
 
-def get_ig_reels(username, days_ago=30):
+def get_ig_reels(username, days_ago):
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_ago)
     run_input = {"username": [username], "resultsLimit": 50, "resultsType": "posts"}
     try:
@@ -183,7 +185,6 @@ def transcribe_video(url, platform_type):
         if not dataset_items: return "N/A"
         
         item = dataset_items[0]
-        # Helper to find text in various possible fields
         if platform_type == "YouTube Shorts":
             if item.get("subtitles"): return " ".join([l.get('text', '') for l in item.get("subtitles")])
             return item.get("transcript", "N/A")
@@ -245,8 +246,26 @@ with col1:
 st.divider()
 st.subheader("⚙️ Filter & Math Logic")
 c1, c2, c3 = st.columns(3)
+
+# ✅ UPDATED: Added your requested time options and parsing logic
 with c1:
-    days_ago = int(st.selectbox("Scan Last:", ["30 Days", "60 Days", "90 Days"]).split(" ")[0])
+    time_options = [
+        "30 Days", "60 Days", "90 Days", "180 Days", "365 Days", 
+        "1.5 Years", "2 Years", "Full History"
+    ]
+    selected_time = st.selectbox("Scan Last:", time_options, index=0)
+    
+    # Parse the selected string into integer 'days_ago'
+    if selected_time == "Full History":
+        days_ago = 10000 # ~27 years (covers entire history of YT/IG)
+    elif "Year" in selected_time:
+        # "1.5 Years" -> 1.5
+        years = float(selected_time.split(" ")[0])
+        days_ago = int(years * 365)
+    else:
+        # "30 Days" -> 30
+        days_ago = int(selected_time.split(" ")[0])
+
 with c2:
     manual_baseline = st.number_input("Baseline Views (Avg):", min_value=1000, value=10000, step=1000)
 with c3:
@@ -254,7 +273,6 @@ with c3:
 
 target_views = manual_baseline * viral_multiplier
 
-# ✅ UI FIX: Using st.success for proper alignment and clean look
 st.success(f"📊 **Viral Formula:** Any video with views > **{manual_baseline:,}** (Baseline) × **{viral_multiplier}** (Multiplier) = **{target_views:,} Views**")
 
 if st.button("🚀 Start Deep Analysis", type="primary"):
