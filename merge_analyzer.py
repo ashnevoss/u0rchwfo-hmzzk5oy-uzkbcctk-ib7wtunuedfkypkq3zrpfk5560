@@ -11,15 +11,18 @@ from datetime import datetime, timedelta, timezone
 import concurrent.futures
 
 # ================= CONFIGURATION =================
-# 1. SCOUT: Official Apify Instagram Scraper
-IG_SCOUT_ACTOR = "apify/instagram-scraper"
+# 1. SCOUT (Metadata): Used to check counts cheaply
+IG_PROFILE_ACTOR = "apify/instagram-profile-scraper" 
 
-# 2. TRANSCRIBERS: 
+# 2. DEEP SCRAPE (Content): Used to get actual reels
+IG_REEL_ACTOR = "xMc5Ga1oCONPmWJIa" 
+
+# 3. TRANSCRIBERS: 
 IG_TRANSCRIBER_ACTOR = "QDd59HBnZaQ89Rghe" 
 YT_TRANSCRIBER_ACTOR = "akash9078/youtube-transcript-extractor"
 # =================================================
 
-st.set_page_config(page_title="Universal Viral Analyzer", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="Universal Viral Analyzer Pro", page_icon="🚀", layout="wide")
 
 # --- SIDEBAR: PLATFORM SELECTION & UPLOADS ---
 st.sidebar.title("⚙️ Settings")
@@ -95,13 +98,10 @@ def generate_topic_with_ai(transcript):
         return "General"
 
 def identify_format_with_ai(transcript):
-    """
-    Classifies the video into one of the user's specific formats.
-    """
     if not transcript or len(transcript) < 5 or transcript == "N/A": 
         return "Unknown"
         
-    preview_text = transcript[:2000] # Analyze slightly more text for context
+    preview_text = transcript[:2000]
     
     format_list = """
     1. Celebrity Format (Discussing or using a celebrity hook)
@@ -183,80 +183,144 @@ def get_yt_shorts(channel_id, api_key, days_ago):
     except Exception as e:
         return []
 
-def get_ig_reels(username, days_ago):
-    username = username.strip().replace("@", "")
-    profile_url = f"https://www.instagram.com/{username}/"
+# --- NEW FUNCTION: SMART PROFILE CHECK ---
+def get_ig_profile_stats(username):
+    """
+    Quickly fetches just the profile metadata to get the total posts count.
+    Cost: Very low (~$0.01 or free tier).
+    """
+    try:
+        run_input = { "usernames": [username] }
+        # Uses the cheaper 'instagram-profile-scraper'
+        run = apify_client.actor(IG_PROFILE_ACTOR).call(run_input=run_input)
+        
+        if not run: return None
+        
+        dataset_items = apify_client.dataset(run["defaultDatasetId"]).list_items().items
+        if dataset_items:
+            item = dataset_items[0]
+            # postsCount is usually the total media count (Photos + Reels)
+            return item.get("postsCount") or item.get("mediaCount")
+    except Exception as e:
+        print(f"Profile Stat Check Failed: {e}")
+    return None
 
-    st.info(f"🕵️ DEBUG: Scouting via Apify Official Scraper for '{username}'...")
+def get_ig_reels(username, days_ago):
+    # 1. CLEAN USERNAME
+    username = username.strip().replace("@", "")
+    username = username.strip().replace("https://www.instagram.com/", "").replace("/", "")
     
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    # 2. SMART PRE-FLIGHT CHECK
+    # Check how many posts actually exist before we commit to scraping
+    st.info(f"🕵️ Phase 1: Checking Profile Stats for '{username}'...")
+    total_posts = get_ig_profile_stats(username)
+    
+    dynamic_limit = 50 # Default fallback
+    
+    if total_posts:
+        st.success(f"✅ Profile Found: User has **{total_posts}** total posts.")
+        
+        if days_ago > 365:
+            # Full History Strategy:
+            # Set limit to exactly the total posts (plus small buffer) to get EVERYTHING.
+            dynamic_limit = total_posts + 20
+            st.write(f"🚀 Strategy: **Full History Mode** | Setting Limit to **{dynamic_limit}** to capture all reels.")
+        else:
+            # Recent History Strategy:
+            # Estimate 3 posts/day max for the time period.
+            estimated_posts = days_ago * 3
+            dynamic_limit = min(estimated_posts, total_posts)
+            st.write(f"📉 Strategy: **Recent Mode** ({days_ago} days) | Setting Limit to **{dynamic_limit}**.")
+    else:
+        st.warning("⚠️ Could not verify total posts count. Using fallback estimation.")
+        dynamic_limit = 1000 if days_ago > 365 else days_ago * 3
+
+    # Safety floor
+    if dynamic_limit < 50: dynamic_limit = 50
+
+    # 3. RUN THE DEEP SCRAPER
+    st.info(f"🕵️ Phase 2: Deep Scraping via Actor ({IG_REEL_ACTOR})...")
     
     run_input = {
-        "directUrls": [profile_url],
-        "resultsType": "posts", 
-        "resultsLimit": 100 if days_ago < 60 else 200,
-        "searchType": "hashtag", 
-        "searchLimit": 1,
+        "username": [username],
+        "resultsLimit": dynamic_limit,
+        "includeSharesCount": False,
+        "skipPinnedPosts": False, 
     }
     
     try:
-        run = apify_client.actor(IG_SCOUT_ACTOR).call(run_input=run_input)
-        dataset_items = apify_client.dataset(run["defaultDatasetId"]).list_items().items
+        run = apify_client.actor(IG_REEL_ACTOR).call(run_input=run_input)
         
-        st.write(f"📦 **Raw Items Scouted:** {len(dataset_items)}")
+        if not run:
+            st.error("❌ Apify run failed to start.")
+            return []
+
+        dataset_items = apify_client.dataset(run["defaultDatasetId"]).list_items().items
+        st.write(f"📦 **Raw Items Retrieved:** {len(dataset_items)}")
+        
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_ago)
         
         valid_reels = []
-        skipped_count = 0
+        skipped_old = 0
+        skipped_error = 0
         
         for item in dataset_items:
-            item_type = item.get("type", "Unknown")
-            if item_type not in ["Video", "Reel", "IGTV"]:
-                if not item.get("videoPlayCount") and not item.get("videoViewCount"):
-                    skipped_count += 1
-                    continue
-
-            ts_str = item.get("timestamp")
+            # --- DATE PARSING ---
+            ts = item.get("timestamp") or item.get("takenAt") or item.get("date")
             reel_date = None
-            if ts_str:
-                try:
-                    reel_date = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
-                except ValueError:
-                    try:
-                        reel_date = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                    except:
-                        pass
             
-            if not reel_date or reel_date < cutoff_date:
-                skipped_count += 1
+            try:
+                if ts:
+                    if isinstance(ts, (int, float)):
+                        reel_date = datetime.fromtimestamp(ts, tz=timezone.utc)
+                    elif isinstance(ts, str):
+                        if ts.isdigit():
+                             reel_date = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                        else:
+                            formats = ["%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"]
+                            for fmt in formats:
+                                try:
+                                    reel_date = datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
+                                    break
+                                except ValueError:
+                                    continue
+            except Exception:
+                pass
+            
+            if not reel_date:
+                skipped_error += 1
+                continue
+                
+            if reel_date < cutoff_date:
+                skipped_old += 1
                 continue
 
-            plays = item.get("videoPlayCount")
-            if plays is None: plays = item.get("videoViewCount")
-            if plays is None: plays = item.get("playCount")
-            if plays is None: plays = item.get("viewCount")
-            if plays is None: plays = 0
+            # --- VIEWS & URL ---
+            views = item.get("playCount") or item.get("viewCount") or item.get("videoViewCount")
+            if views is None: views = 0
             
-            short_code = item.get("shortCode") or item.get("code")
-            post_url = item.get("url")
-            
-            if not post_url and short_code:
-                post_url = f"https://www.instagram.com/reel/{short_code}/"
-            elif post_url and "/p/" in post_url:
-                 post_url = post_url.replace("/p/", "/reel/")
+            post_url = item.get("url") or item.get("videoUrl")
+            if not post_url:
+                code = item.get("shortCode") or item.get("code")
+                if code:
+                    post_url = f"https://www.instagram.com/reel/{code}/"
             
             if not post_url:
+                skipped_error += 1
                 continue
 
             valid_reels.append({
                 "title": (item.get("caption") or "")[:50] + "...",
                 "full_caption": item.get("caption") or "",
-                "views": int(plays),
+                "views": int(views),
                 "url": post_url,
                 "published": reel_date.strftime('%Y-%m-%d'),
-                "id": item.get("id") or short_code
+                "id": item.get("id")
             })
             
-        st.write(f"✅ **Valid Reels Found:** {len(valid_reels)} (Skipped {skipped_count})")
+        st.write(f"✅ **Valid Reels Filtered:** {len(valid_reels)}")
+        if skipped_old > 0: st.info(f"ℹ️ Filtered out {skipped_old} older posts.")
+        
         return sorted(valid_reels, key=lambda x: x['views'], reverse=True)
         
     except Exception as e:
@@ -276,7 +340,8 @@ def transcribe_video(url, platform_type):
             return str(t) if t else "N/A"
             
         else:
-            clean_url = url.replace("/p/", "/reel/")
+            clean_url = url.split("?")[0] # Remove query params
+            if "/p/" in clean_url: clean_url = clean_url.replace("/p/", "/reel/")
             
             run_input = {
                 "instagramUrl": clean_url,
@@ -295,20 +360,20 @@ def transcribe_video(url, platform_type):
             
             if item.get("text"): return str(item["text"])
             if item.get("transcript"): return str(item["transcript"])
-            if item.get("transcription"): return str(item["transcription"])
-            if item.get("result"): return str(item["result"])
             
-            for key, value in item.items():
-                if isinstance(value, str) and len(value) > 50:
-                    return value
-                if isinstance(value, dict):
-                    for sub_key, sub_value in value.items():
-                        if isinstance(sub_value, str) and len(sub_value) > 50:
-                            return sub_value
-            return str(item)
+            def extract_text(data):
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if k in ["text", "transcript", "result"] and isinstance(v, str) and len(v) > 10: 
+                            return v
+                        res = extract_text(v)
+                        if res: return res
+                return None
+                
+            found_text = extract_text(item)
+            return found_text if found_text else "N/A"
 
     except Exception as e:
-        print(f"Transcribe Error: {e}")
         return "N/A"
 
 # ================= THREADED PROCESSING =================
@@ -322,18 +387,13 @@ def process_single_video(video, platform_type, baseline):
     
     # Try to transcribe
     transcript_data = transcribe_video(video['url'], platform_type)
-    
-    # Safety Force String
-    if isinstance(transcript_data, dict):
-        transcript = str(transcript_data)
-    else:
-        transcript = str(transcript_data)
+    transcript = str(transcript_data)
     
     # Fallback Logic
     is_caption_fallback = False
-    if not transcript or len(transcript) < 5 or transcript == "N/A":
+    if not transcript or len(transcript) < 10 or "N/A" in transcript or "{" in transcript:
         caption = video.get("full_caption", "")
-        if caption and len(str(caption)) > 5:
+        if caption and len(str(caption)) > 10:
             transcript = str(caption)
             is_caption_fallback = True
             calc_log.append("   • ⚠️ **Warning:** Audio Transcript failed. Using Instagram Caption as fallback.")
@@ -343,17 +403,16 @@ def process_single_video(video, platform_type, baseline):
     else:
         calc_log.append(f"   • 📝 **Transcript:** Found ({len(transcript)} chars)")
     
-    # --- AI ANALYSIS (Updated with Format) ---
+    # --- AI ANALYSIS ---
     hook = extract_hook_with_ai(transcript)
     topic = generate_topic_with_ai(transcript)
-    video_format = identify_format_with_ai(transcript) # <--- NEW FUNCTION CALLED HERE
+    video_format = identify_format_with_ai(transcript) 
     
     calc_log.append(f"   • 🧠 **AI Analysis:** Topic: '{topic}' | Format: '{video_format}'")
     calc_log.append(f"   • ✅ **Success:** Row generated.")
 
     final_transcript = f"[CAPTION ONLY] {transcript}" if is_caption_fallback else transcript
 
-    # Updated Row Structure: Topic, Format, Views...
     row = [topic, video_format, video['views'], f"{round(multiplier, 1)}x", video['published'], video['url'], hook, final_transcript[:40000]]
     
     return row, "\n".join(calc_log)
@@ -365,7 +424,7 @@ if platform == "YouTube Shorts":
     handle_label = "YouTube Handle"
     default_handle = "@BusyFunda"
 else:
-    st.title("📸 Instagram Viral Analyzer (Format Edition)")
+    st.title("📸 Instagram Viral Analyzer (Smart Edition)")
     handle_label = "Instagram Username"
     default_handle = "sanjay_nuthra"
 
@@ -425,7 +484,7 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
                 videos = get_ig_reels(target_handle, days_ago)
 
             if not videos:
-                status.update(label="❌ No videos found.", state="error")
+                status.update(label="❌ No videos found (Check permissions/username).", state="error")
                 st.stop()
 
             st.write(f"📉 Found {len(videos)} total videos. Filtering for viral hits...")
@@ -470,13 +529,11 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
 
         if results_to_save:
             existing = sheet.get_all_values()
-            # Updated Headers with 'Format'
             if not existing:
                 sheet.append_row(['Topic', 'Format', 'Views', 'Multiplier', 'Date', 'URL', 'Hook', 'Transcript'])
             sheet.append_rows(results_to_save)
             st.success(f"🎉 Analysis Complete! Saved {len(results_to_save)} rows to Google Sheets.")
             
-            # Display DataFrame with new column
             st.dataframe(pd.DataFrame(results_to_save, columns=['Topic', 'Format', 'Views', 'Multiplier', 'Date', 'URL', 'Hook', 'Transcript']))
 
     except Exception as e:
