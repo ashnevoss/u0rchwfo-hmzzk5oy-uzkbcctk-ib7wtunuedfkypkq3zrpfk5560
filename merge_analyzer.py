@@ -13,14 +13,11 @@ import re
 
 # ================= CONFIGURATION =================
 # 1. TRANSCRIBERS (Using Apify Actors)
-# IG Transcriber: "QDd59HBnZaQ89Rghe" (Reliable, uses OpenAI key)
-# YT Transcriber: "akash9078/youtube-transcript-extractor"
 IG_TRANSCRIBER_ACTOR = "QDd59HBnZaQ89Rghe" 
 YT_TRANSCRIBER_ACTOR = "bbqmsPr0r519A0ZaV"
 
 # 2. LANGUAGE SETTINGS
-# 'hi' = Hindi (Fixes "No Content" on Indian videos), 'en' = English
-YT_LANGUAGE_PREFERENCE = "hi" 
+YT_LANGUAGE_PREFERENCE = "en" 
 # =================================================
 
 st.set_page_config(page_title="Universal Viral Analyzer Pro", page_icon="🚀", layout="wide")
@@ -60,17 +57,62 @@ if uploaded_api_keys:
 
 # ================= CORE AI FUNCTIONS =================
 
+def translate_title_with_ai(title):
+    """
+    Fallback: Ensures the raw title is in English if transcript is missing.
+    """
+    if not title or title == "N/A":
+        return "Unknown Title"
+    if all(ord(c) < 128 for c in title.replace(" ", "")):
+        return title
+    prompt = (
+        f"Translate the following video title into English. \n"
+        f"Return ONLY the English translation, no other text.\n\n"
+        f"Original Title: {title}"
+    )
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini", 
+            messages=[{"role": "user", "content": prompt}], 
+            temperature=0.1
+        )
+        return response.choices[0].message.content.strip().replace('"', '')
+    except Exception:
+        return title
+
+def generate_title_from_transcript(transcript):
+    """
+    Generates a concise title based on the video content.
+    """
+    if not transcript or len(transcript) < 20 or "N/A" in transcript: 
+        return None  # Return None so we can fallback to raw title
+    
+    preview_text = transcript[:1500] # Give AI enough context
+    
+    prompt = (
+        "Read the following video transcript and generate a CONCISE English title (3-6 words).\n"
+        "The title should summarize exactly what the video is about.\n"
+        "Do not use clickbait. Just state the topic clearly.\n"
+        "Return ONLY the title text.\n\n"
+        f"Transcript:\n{preview_text}"
+    )
+    
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini", 
+            messages=[{"role": "user", "content": prompt}], 
+            temperature=0.3 
+        )
+        title_text = response.choices[0].message.content.strip().replace('"', '')
+        return title_text
+    except Exception:
+        return None
+
 def extract_hook_with_ai(transcript):
-    """
-    Simplified Logic: Gives full context and asks directly for the hook.
-    No complex JSON or token limits.
-    """
     if not transcript or len(transcript) < 5 or transcript == "N/A": 
         return "N/A"
     
-    # Give it plenty of text (1000 chars) so it understands the full context
     preview_text = transcript[:1000]
-    
     prompt = (
         "I will provide a video transcript below.\n"
         "Identify the HOOK. The hook is the first 1 or 2 sentences that grab the viewer's attention.\n"
@@ -80,40 +122,16 @@ def extract_hook_with_ai(transcript):
         "3. Quote the text exactly from the transcript.\n\n"
         f"Transcript:\n{preview_text}"
     )
-    
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini", 
             messages=[{"role": "user", "content": prompt}], 
-            temperature=0.2 # Slight creativity allowed to identify the best sentence
+            temperature=0.2 
         )
-        
         hook_text = response.choices[0].message.content.strip().replace('"', '')
-        
         return hook_text
-
     except Exception:
-        # Simple fallback
         return transcript[:100] + "..."
-
-def generate_topic_with_ai(transcript):
-    if not transcript or len(transcript) < 5 or transcript == "N/A": 
-        return "Unknown"
-        
-    preview_text = transcript[:1000]
-    prompt = (
-        "Analyze this video transcript. \n"
-        "Generate a short, 3-5 word 'Topic Label' or 'Category'.\n"
-        "Return ONLY the topic label.\n\n"
-        f"Transcript:\n{preview_text}"
-    )
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0.3
-        )
-        return response.choices[0].message.content.strip().replace('"', '')
-    except Exception:
-        return "General"
 
 # ================= DATA FETCHING FUNCTIONS =================
 
@@ -134,7 +152,6 @@ def get_yt_shorts(channel_id, api_key, days_ago):
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_ago)
     published_after = cutoff_date.strftime('%Y-%m-%dT%H:%M:%SZ')
     
-    # Debug stats
     stats = {"total_fetched": 0, "date_filtered": 0, "valid": 0}
     
     url = "https://youtube.googleapis.com/youtube/v3/search"
@@ -173,14 +190,8 @@ def get_yt_shorts(channel_id, api_key, days_ago):
         return [], stats
 
 def load_sortfeed_data(uploaded_file):
-    """
-    Parses the Sortfeed export CSV.
-    Expected columns: Profile, Reel, Views, Likes, Comments
-    """
     try:
         df = pd.read_csv(uploaded_file)
-        
-        # Validation: Check for minimal required columns
         required_cols = ['Reel', 'Views']
         if not all(col in df.columns for col in required_cols):
              st.error(f"❌ CSV format error. Missing required columns (Reel, Views). Found: {df.columns.tolist()}")
@@ -189,25 +200,21 @@ def load_sortfeed_data(uploaded_file):
         videos = []
         for index, row in df.iterrows():
             url = str(row['Reel']).strip()
-            
-            # Extract ID from URL for cleaner display
-            # Example: https://www.instagram.com/user/reel/DRUmnhWkjgy/ -> DRUmnhWkjgy
             short_code = "Unknown"
             match = re.search(r'/reel/([^/]+)', url)
             if match:
                 short_code = match.group(1)
             
             views = row['Views']
-            # Clean views if they are strings (remove commas, k, M)
             if isinstance(views, str):
                  views = int(''.join(filter(str.isdigit, views))) if any(c.isdigit() for c in views) else 0
             
             videos.append({
-                "title": f"Reel {short_code}", # Sortfeed doesn't give titles, use ID
-                "full_caption": "", # Sortfeed doesn't give captions
+                "title": f"Reel {short_code}", 
+                "full_caption": "", 
                 "views": int(views),
                 "url": url,
-                "published": "N/A", # Sortfeed doesn't give dates
+                "published": "N/A",
                 "id": short_code
             })
         
@@ -221,7 +228,6 @@ def load_sortfeed_data(uploaded_file):
 def transcribe_video(url, platform_type):
     try:
         if platform_type == "YouTube Shorts":
-            # [FIXED] Added language parameter to handle Hindi/Regional videos
             run_input = {
                 "videoUrl": url,
                 "language": YT_LANGUAGE_PREFERENCE,
@@ -230,25 +236,17 @@ def transcribe_video(url, platform_type):
             run = apify_client.actor(YT_TRANSCRIBER_ACTOR).call(run_input=run_input, timeout_secs=180)
             
             if not run: return "N/A"
-            
             dataset_items = apify_client.dataset(run["defaultDatasetId"]).list_items().items
             if not dataset_items: return "N/A"
-            
             item = dataset_items[0]
-            # Try to grab text from various known output keys
             if item.get("text"): return str(item["text"])
-            
-            # If transcript is a list of segments, join them
             t = item.get("transcript")
             if isinstance(t, list): 
                 return " ".join([seg.get('text', '') for seg in t])
-            
             return str(t) if t else "N/A"
             
         else:
-            # --- INSTAGRAM TRANSCRIPTION (Uses OpenAI Actor) ---
             clean_url = url.split("?")[0].replace("/p/", "/reel/")
-            
             run_input = {
                 "instagramUrl": clean_url,
                 "openaiApiKey": OPENAI_API_KEY_VAL,
@@ -256,18 +254,13 @@ def transcribe_video(url, platform_type):
                 "model": "gpt-4o-mini-transcribe",
                 "response_format": "json"
             }
-            
             run = apify_client.actor(IG_TRANSCRIBER_ACTOR).call(run_input=run_input, timeout_secs=240)
             dataset_items = apify_client.dataset(run["defaultDatasetId"]).list_items().items
-            
             if not dataset_items: return "N/A"
-            
             item = dataset_items[0]
-            
             if item.get("text"): return str(item["text"])
             if item.get("transcript"): return str(item["transcript"])
             
-            # Deep search for text in nested JSON
             def extract_text(data):
                 if isinstance(data, dict):
                     for k, v in data.items():
@@ -276,7 +269,6 @@ def transcribe_video(url, platform_type):
                         res = extract_text(v)
                         if res: return res
                 return None
-                
             found_text = extract_text(item)
             return found_text if found_text else "N/A"
 
@@ -290,23 +282,18 @@ def process_single_video(video, platform_type, baseline, enable_transcription):
     calc_log = []
     
     calc_log.append(f"🎬 **Processing:** [{video['title']}]({video['url']})")
-    multiplier = video['views'] / baseline
-    calc_log.append(f"   • 🧮 **Math:** {video['views']:,} / {baseline:,} = **{multiplier:.2f}x**")
     
     transcript = "N/A"
     
-    # --- LOGIC: CHECK IF TRANSCRIPTION IS ENABLED ---
+    # --- TRANSCRIPTION LOGIC ---
     if enable_transcription:
-        # Try to transcribe using paid actor
         transcript_data = transcribe_video(video['url'], platform_type)
         transcript = str(transcript_data)
     else:
         calc_log.append("   • 💰 **Economy Mode:** Skipped AI Transcription.")
 
-    # Fallback / Economy Mode Logic
     is_caption_fallback = False
     if not transcript or len(transcript) < 10 or "N/A" in transcript:
-        # Sortfeed usually doesn't give captions, so this fallback might be empty
         caption = video.get("full_caption", "")
         if caption and len(str(caption)) > 5:
             transcript = str(caption)
@@ -315,29 +302,49 @@ def process_single_video(video, platform_type, baseline, enable_transcription):
             calc_log.append("   • 📝 **Source:** Using Caption.")
         else:
             if not enable_transcription:
-                calc_log.append("   • ⚠️ **Warning:** No transcription and no caption available.")
+                calc_log.append("   • ⚠️ **Warning:** No transcription available.")
             else:
                 calc_log.append("   • ❌ **Status:** Transcription Failed.")
-            # We don't fail here anymore, we just return empty transcript so we can still save the views data
             transcript = "N/A (No Audio/Caption)"
     else:
         result_stats["transcribed"] = True
         calc_log.append(f"   • 🎙️ **Source:** AI Transcript ({len(transcript)} chars)")
     
-    # --- AI ANALYSIS ---
-    # Only analyze if we actually have text
-    if len(transcript) > 20 and "N/A" not in transcript[:5]:
-        hook = extract_hook_with_ai(transcript)
-        topic = generate_topic_with_ai(transcript)
-    else:
-        hook = "N/A"
-        topic = "Unknown"
-    
-    calc_log.append(f"   • 🧠 **AI Analysis:** Topic: '{topic}'")
+    # --- AI ANALYSIS: HOOK & TITLE GENERATION ---
+    final_title = "N/A"
+    hook = "N/A"
 
+    if len(transcript) > 20 and "N/A" not in transcript[:5]:
+        # 1. Extract Hook
+        hook = extract_hook_with_ai(transcript)
+        
+        # 2. Generate Smart Title from Transcript
+        generated_title = generate_title_from_transcript(transcript)
+        
+        if generated_title:
+            final_title = generated_title
+            calc_log.append(f"   • 🧠 **AI Title:** {final_title}")
+        else:
+            # Fallback to translation if AI title fails
+            final_title = translate_title_with_ai(video['title'])
+            calc_log.append(f"   • ⚠️ **AI Title Failed:** Using Translated Raw Title")
+    else:
+        # Fallback if no transcript
+        final_title = translate_title_with_ai(video['title'])
+    
     final_transcript = f"[CAPTION ONLY] {transcript}" if is_caption_fallback else transcript
     
-    row = [topic, video['views'], f"{round(multiplier, 1)}x", video['published'], video['url'], hook, final_transcript[:40000]]
+    # --- CONSTRUCT ROW ---
+    row = [
+        final_title,                # Title (AI Generated from Transcript)
+        video['url'],               # Link
+        "",                         # Format
+        video['views'],             # Views
+        hook,                       # Hook
+        final_transcript[:40000],   # Transcription
+        "",                         # Made with Growingly
+        ""                          # Is this Youtube
+    ]
     
     return row, "\n".join(calc_log), result_stats
 
@@ -375,8 +382,8 @@ with c1:
         selected_time = st.selectbox("Scan Last:", time_options, index=2)
         days_ago = int(selected_time.split(" ")[0])
     else:
-        st.warning("📅 Date Filter Disabled (Data from CSV)")
-        days_ago = 9999 # Ignored for Sortfeed
+        st.text_input("Scan Last:", value="Data from CSV", disabled=True, help="Date filtering is disabled because we are using uploaded CSV data.")
+        days_ago = 9999 
 
 with c2:
     manual_baseline = st.number_input("Baseline Views (Avg):", min_value=1000, value=10000, step=1000)
@@ -412,12 +419,10 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
                 if not channel_id: st.stop()
                 videos, scrape_stats = get_yt_shorts(channel_id, YOUTUBE_API_KEY, days_ago)
             else:
-                # INSTAGRAM / SORTFEED LOGIC
                 if not uploaded_sortfeed:
                     st.error("Please upload a Sortfeed CSV file.")
                     st.stop()
                 
-                # Reset file pointer if needed
                 uploaded_sortfeed.seek(0)
                 videos = load_sortfeed_data(uploaded_sortfeed)
                 scrape_stats = {"raw_fetched": len(videos)}
@@ -426,7 +431,6 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
                 status_box.update(label="❌ No videos found.", state="error")
                 st.stop()
 
-            # FILTER: View Count
             targets = []
             skipped_low_views = []
             
@@ -468,13 +472,11 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
         st.divider()
         st.subheader(f"📝 Processing {len(targets)} Viral Videos")
         
-        # COST CONTROL CHECKBOX
         enable_ai_audio = st.checkbox("🎙️ Enable AI Audio Transcription", value=True, help="Uncheck to save money and use captions only. Check to use OpenAI transcription.")
 
         log_container = st.container()
         results_to_save = []
         
-        # Track Processing Stats
         proc_stats = {"audio_transcribed": 0, "caption_used": 0, "failed": 0}
         
         progress_bar = st.progress(0)
@@ -489,7 +491,6 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
             for future in concurrent.futures.as_completed(future_to_video):
                 row, log_text, p_stat = future.result()
                 
-                # Update Stats
                 if p_stat["transcribed"]: proc_stats["audio_transcribed"] += 1
                 if p_stat["caption_fallback"]: proc_stats["caption_used"] += 1
                 if p_stat["failed"]: proc_stats["failed"] += 1
@@ -515,13 +516,17 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
 
         if results_to_save:
             existing = sheet.get_all_values()
+            
+            new_headers = ['Title', 'Link', 'Format', 'Views', 'Hook', 'Transcription', 'Made with Growingly', 'Is this Youtube']
+            
             if not existing:
-                sheet.append_row(['Topic', 'Views', 'Multiplier', 'Date', 'URL', 'Hook', 'Transcript'])
+                sheet.append_row(new_headers)
+            
             sheet.append_rows(results_to_save)
             st.success(f"🎉 Analysis Complete! Saved {len(results_to_save)} rows to Google Sheets.")
             
             with st.expander("📄 View Final Data"):
-                st.dataframe(pd.DataFrame(results_to_save, columns=['Topic', 'Views', 'Multiplier', 'Date', 'URL', 'Hook', 'Transcript']))
+                st.dataframe(pd.DataFrame(results_to_save, columns=new_headers))
 
     except Exception as e:
         st.error(f"Critical Error: {e}")
