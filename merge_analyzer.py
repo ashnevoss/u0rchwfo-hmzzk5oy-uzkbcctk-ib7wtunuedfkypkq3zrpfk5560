@@ -334,16 +334,19 @@ def process_single_video(video, platform_type, baseline, enable_transcription):
     
     final_transcript = f"[CAPTION ONLY] {transcript}" if is_caption_fallback else transcript
     
-    # --- CONSTRUCT ROW ---
+    # --- CONSTRUCT ROW (UPDATED FORMAT) ---
+    # Title, Link, Format, Category, Subcategory, Views, Hook, Transcription, Made with growingly, Is this Youtube
     row = [
-        final_title,                # Title (AI Generated from Transcript)
+        final_title,                # Title
         video['url'],               # Link
         "",                         # Format
+        "",                         # Category (Empty)
+        "",                         # Subcategory (Empty)
         video['views'],             # Views
         hook,                       # Hook
         final_transcript[:40000],   # Transcription
-        "",                         # Made with Growingly
-        ""                          # Is this Youtube
+        "",                         # Made with Growingly (Empty)
+        ""                          # Is this Youtube (Empty)
     ]
     
     return row, "\n".join(calc_log), result_stats
@@ -472,7 +475,8 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
         st.divider()
         st.subheader(f"📝 Processing {len(targets)} Viral Videos")
         
-        enable_ai_audio = st.checkbox("🎙️ Enable AI Audio Transcription", value=True, help="Uncheck to save money and use captions only. Check to use OpenAI transcription.")
+        # --- MODIFICATION: CHECKBOX REMOVED, FORCED ON ---
+        enable_ai_audio = True
 
         log_container = st.container()
         results_to_save = []
@@ -517,7 +521,8 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
         if results_to_save:
             existing = sheet.get_all_values()
             
-            new_headers = ['Title', 'Link', 'Format', 'Views', 'Hook', 'Transcription', 'Made with Growingly', 'Is this Youtube']
+            # UPDATED HEADERS
+            new_headers = ['Title', 'Link', 'Format', 'Category', 'Subcategory', 'Views', 'Hook', 'Transcription', 'Made with Growingly', 'Is this Youtube']
             
             if not existing:
                 sheet.append_row(new_headers)
