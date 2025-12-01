@@ -9,16 +9,18 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 import concurrent.futures
+import re
 
 # ================= CONFIGURATION =================
-# 1. DEEP SCRAPE (Cheap & Fast - Ultra Barato)
-# Actor ID: nixGoSi2KjxbVYctO (esdrasdw/instagram-reels-scrapy)
-IG_REEL_ACTOR = "nixGoSi2KjxbVYctO" 
-
-# 2. TRANSCRIBERS (ORIGINAL RELIABLE VERSION)
-# This actor uses your OpenAI Key to listen to the video
+# 1. TRANSCRIBERS (Using Apify Actors)
+# IG Transcriber: "QDd59HBnZaQ89Rghe" (Reliable, uses OpenAI key)
+# YT Transcriber: "akash9078/youtube-transcript-extractor"
 IG_TRANSCRIBER_ACTOR = "QDd59HBnZaQ89Rghe" 
-YT_TRANSCRIBER_ACTOR = "akash9078/youtube-transcript-extractor"
+YT_TRANSCRIBER_ACTOR = "bbqmsPr0r519A0ZaV"
+
+# 2. LANGUAGE SETTINGS
+# 'hi' = Hindi (Fixes "No Content" on Indian videos), 'en' = English
+YT_LANGUAGE_PREFERENCE = "hi" 
 # =================================================
 
 st.set_page_config(page_title="Universal Viral Analyzer Pro", page_icon="🚀", layout="wide")
@@ -59,23 +61,40 @@ if uploaded_api_keys:
 # ================= CORE AI FUNCTIONS =================
 
 def extract_hook_with_ai(transcript):
+    """
+    Simplified Logic: Gives full context and asks directly for the hook.
+    No complex JSON or token limits.
+    """
     if not transcript or len(transcript) < 5 or transcript == "N/A": 
         return "N/A"
     
+    # Give it plenty of text (1000 chars) so it understands the full context
     preview_text = transcript[:1000]
+    
     prompt = (
-        "You are a Viral Content Analyst. Analyze the transcript below.\n"
-        "Goal: Extract the 'HOOK' (the very first sentence or 3-5 seconds of audio).\n"
-        "Rules: Return ONLY the exact text of the hook. Do NOT translate.\n\n"
-        f"Transcript Start:\n{preview_text}"
+        "I will provide a video transcript below.\n"
+        "Identify the HOOK. The hook is the first 1 or 2 sentences that grab the viewer's attention.\n"
+        "Instructions:\n"
+        "1. Extract ONLY the hook text.\n"
+        "2. Do not add any explanation or labels.\n"
+        "3. Quote the text exactly from the transcript.\n\n"
+        f"Transcript:\n{preview_text}"
     )
+    
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0.1
+            model="gpt-4o-mini", 
+            messages=[{"role": "user", "content": prompt}], 
+            temperature=0.2 # Slight creativity allowed to identify the best sentence
         )
-        return response.choices[0].message.content.strip()
+        
+        hook_text = response.choices[0].message.content.strip().replace('"', '')
+        
+        return hook_text
+
     except Exception:
-        return transcript[:50] + "..."
+        # Simple fallback
+        return transcript[:100] + "..."
 
 def generate_topic_with_ai(transcript):
     if not transcript or len(transcript) < 5 or transcript == "N/A": 
@@ -153,112 +172,83 @@ def get_yt_shorts(channel_id, api_key, days_ago):
         st.error(f"YT API Error: {e}")
         return [], stats
 
-def get_ig_reels(username, days_ago):
-    # Stats container
-    scrape_stats = {
-        "raw_fetched": 0,
-        "date_filtered": 0,
-        "valid_date_range": 0,
-        "rejected_log": []
-    }
-
-    username = username.strip().replace("@", "")
-    username = username.strip().replace("https://www.instagram.com/", "").replace("/", "")
-    
-    # Estimate quantity
-    estimated_quantity = max(50, days_ago * 3) 
-    if estimated_quantity > 500: estimated_quantity = 500
-    
-    st.info(f"🕵️ Scraping via Ultra Barato API... (Targeting {estimated_quantity} items for {username})")
-
-    run_input = {
-        "usernames": [username],
-        "quantity_per_user": estimated_quantity,
-        "selected_fields": [
-            "thumb", "titulo", "usuario", "link_post", 
-            "data_criacao_iso", "visualizacoes", "curtidas", 
-            "comentarios", "duracao"
-        ],
-    }
-    
+def load_sortfeed_data(uploaded_file):
+    """
+    Parses the Sortfeed export CSV.
+    Expected columns: Profile, Reel, Views, Likes, Comments
+    """
     try:
-        cutoff_date_obj = datetime.now(timezone.utc) - timedelta(days=days_ago)
+        df = pd.read_csv(uploaded_file)
         
-        run = apify_client.actor(IG_REEL_ACTOR).call(run_input=run_input)
-        if not run: return [], scrape_stats
-
-        dataset_items = apify_client.dataset(run["defaultDatasetId"]).list_items().items
-        scrape_stats["raw_fetched"] = len(dataset_items)
+        # Validation: Check for minimal required columns
+        required_cols = ['Reel', 'Views']
+        if not all(col in df.columns for col in required_cols):
+             st.error(f"❌ CSV format error. Missing required columns (Reel, Views). Found: {df.columns.tolist()}")
+             return []
         
-        valid_reels = []
-        
-        for item in dataset_items:
-            date_str = item.get("data_criacao_iso")
-            reel_date = None
+        videos = []
+        for index, row in df.iterrows():
+            url = str(row['Reel']).strip()
             
-            # --- Date Logic ---
-            if date_str:
-                try:
-                    date_str = date_str.replace("Z", "")
-                    reel_date = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
-                except Exception:
-                    pass
+            # Extract ID from URL for cleaner display
+            # Example: https://www.instagram.com/user/reel/DRUmnhWkjgy/ -> DRUmnhWkjgy
+            short_code = "Unknown"
+            match = re.search(r'/reel/([^/]+)', url)
+            if match:
+                short_code = match.group(1)
             
-            caption = item.get("titulo", "") or "No Caption"
-            
-            if not reel_date:
-                scrape_stats["rejected_log"].append({"title": caption[:30], "reason": "No Date Found"})
-                continue
-
-            # FILTER: Date
-            if reel_date < cutoff_date_obj:
-                scrape_stats["date_filtered"] += 1
-                # Optional: log a few old ones just to see
-                if scrape_stats["date_filtered"] < 5:
-                    scrape_stats["rejected_log"].append({"title": caption[:30], "reason": f"Too Old ({reel_date.strftime('%Y-%m-%d')})"})
-                continue
-
-            # --- Mapping ---
-            views = item.get("visualizacoes", 0)
+            views = row['Views']
+            # Clean views if they are strings (remove commas, k, M)
             if isinstance(views, str):
-                views = int(''.join(filter(str.isdigit, views))) if any(c.isdigit() for c in views) else 0
+                 views = int(''.join(filter(str.isdigit, views))) if any(c.isdigit() for c in views) else 0
             
-            post_url = item.get("link_post", "")
-            short_code = post_url.split("/")[-2] if post_url.endswith("/") else post_url.split("/")[-1]
-
-            valid_reels.append({
-                "title": caption[:50] + "...",
-                "full_caption": caption,
+            videos.append({
+                "title": f"Reel {short_code}", # Sortfeed doesn't give titles, use ID
+                "full_caption": "", # Sortfeed doesn't give captions
                 "views": int(views),
-                "url": post_url,
-                "published": reel_date.strftime('%Y-%m-%d'),
+                "url": url,
+                "published": "N/A", # Sortfeed doesn't give dates
                 "id": short_code
             })
-            
-        scrape_stats["valid_date_range"] = len(valid_reels)
-        return sorted(valid_reels, key=lambda x: x['views'], reverse=True), scrape_stats
         
+        st.success(f"✅ Successfully loaded {len(videos)} videos from Sortfeed CSV.")
+        return sorted(videos, key=lambda x: x['views'], reverse=True)
+
     except Exception as e:
-        st.error(f"Scraper Error: {e}")
-        return [], scrape_stats
+        st.error(f"Error parsing Sortfeed CSV: {e}")
+        return []
 
 def transcribe_video(url, platform_type):
     try:
         if platform_type == "YouTube Shorts":
-            run_input = {"videoUrl": url} 
+            # [FIXED] Added language parameter to handle Hindi/Regional videos
+            run_input = {
+                "videoUrl": url,
+                "language": YT_LANGUAGE_PREFERENCE,
+                "shouldFetchSubtitles": True
+            }
             run = apify_client.actor(YT_TRANSCRIBER_ACTOR).call(run_input=run_input, timeout_secs=180)
+            
+            if not run: return "N/A"
+            
             dataset_items = apify_client.dataset(run["defaultDatasetId"]).list_items().items
             if not dataset_items: return "N/A"
+            
             item = dataset_items[0]
+            # Try to grab text from various known output keys
+            if item.get("text"): return str(item["text"])
+            
+            # If transcript is a list of segments, join them
             t = item.get("transcript")
-            if isinstance(t, list): return " ".join([seg.get('text', '') for seg in t])
+            if isinstance(t, list): 
+                return " ".join([seg.get('text', '') for seg in t])
+            
             return str(t) if t else "N/A"
             
         else:
-            # --- ORIGINAL RELIABLE LOGIC ---
+            # --- INSTAGRAM TRANSCRIPTION (Uses OpenAI Actor) ---
             clean_url = url.split("?")[0].replace("/p/", "/reel/")
             
-            # This uses your OPENAI key and is more robust
             run_input = {
                 "instagramUrl": clean_url,
                 "openaiApiKey": OPENAI_API_KEY_VAL,
@@ -277,6 +267,7 @@ def transcribe_video(url, platform_type):
             if item.get("text"): return str(item["text"])
             if item.get("transcript"): return str(item["transcript"])
             
+            # Deep search for text in nested JSON
             def extract_text(data):
                 if isinstance(data, dict):
                     for k, v in data.items():
@@ -290,7 +281,7 @@ def transcribe_video(url, platform_type):
             return found_text if found_text else "N/A"
 
     except Exception as e:
-        return "N/A"
+        return f"N/A (Error: {str(e)})"
 
 # ================= THREADED PROCESSING =================
 
@@ -310,34 +301,42 @@ def process_single_video(video, platform_type, baseline, enable_transcription):
         transcript_data = transcribe_video(video['url'], platform_type)
         transcript = str(transcript_data)
     else:
-        calc_log.append("   • 💰 **Economy Mode:** Skipped AI Transcription (Using Caption Only).")
+        calc_log.append("   • 💰 **Economy Mode:** Skipped AI Transcription.")
 
     # Fallback / Economy Mode Logic
     is_caption_fallback = False
     if not transcript or len(transcript) < 10 or "N/A" in transcript:
+        # Sortfeed usually doesn't give captions, so this fallback might be empty
         caption = video.get("full_caption", "")
         if caption and len(str(caption)) > 5:
             transcript = str(caption)
             is_caption_fallback = True
             result_stats["caption_fallback"] = True
-            calc_log.append("   • 📝 **Source:** Using Instagram Caption.")
+            calc_log.append("   • 📝 **Source:** Using Caption.")
         else:
-            calc_log.append("   • ❌ **Status:** No Text Available. Skipping.")
-            result_stats["failed"] = True
-            return None, "\n".join(calc_log), result_stats
+            if not enable_transcription:
+                calc_log.append("   • ⚠️ **Warning:** No transcription and no caption available.")
+            else:
+                calc_log.append("   • ❌ **Status:** Transcription Failed.")
+            # We don't fail here anymore, we just return empty transcript so we can still save the views data
+            transcript = "N/A (No Audio/Caption)"
     else:
         result_stats["transcribed"] = True
         calc_log.append(f"   • 🎙️ **Source:** AI Transcript ({len(transcript)} chars)")
     
     # --- AI ANALYSIS ---
-    hook = extract_hook_with_ai(transcript)
-    topic = generate_topic_with_ai(transcript)
+    # Only analyze if we actually have text
+    if len(transcript) > 20 and "N/A" not in transcript[:5]:
+        hook = extract_hook_with_ai(transcript)
+        topic = generate_topic_with_ai(transcript)
+    else:
+        hook = "N/A"
+        topic = "Unknown"
     
     calc_log.append(f"   • 🧠 **AI Analysis:** Topic: '{topic}'")
 
     final_transcript = f"[CAPTION ONLY] {transcript}" if is_caption_fallback else transcript
     
-    # [UPDATED] Row structure: No Format column
     row = [topic, video['views'], f"{round(multiplier, 1)}x", video['published'], video['url'], hook, final_transcript[:40000]]
     
     return row, "\n".join(calc_log), result_stats
@@ -346,26 +345,38 @@ def process_single_video(video, platform_type, baseline, enable_transcription):
 
 if platform == "YouTube Shorts":
     st.title("🎥 YouTube Viral Analyzer")
+    st.info("Uses YouTube API (Free/Cheap) for discovery.")
     handle_label = "YouTube Handle"
     default_handle = "@BusyFunda"
-else:
-    st.title("📸 Instagram Viral Analyzer (Smart Edition)")
-    handle_label = "Instagram Username"
-    default_handle = "sanjay_nuthra"
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        target_handle = st.text_input(handle_label, value=default_handle)
+    with col2:
+        sheet_name = st.text_input("Google Sheet Name", value="ProjectO1")
 
-col1, col2 = st.columns(2)
-with col1:
-    target_handle = st.text_input(handle_label, value=default_handle)
-    sheet_name = st.text_input("Google Sheet Name", value="ProjectO1")
+else:
+    st.title("📸 Instagram Viral Analyzer (Sortfeed Edition)")
+    st.info("Upload your Sortfeed CSV export below to save on scraping costs.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        uploaded_sortfeed = st.file_uploader("Upload Sortfeed CSV", type=["csv"])
+    with col2:
+        sheet_name = st.text_input("Google Sheet Name", value="ProjectO1")
 
 st.divider()
 st.subheader("⚙️ Filter & Math Logic")
 c1, c2, c3 = st.columns(3)
 
 with c1:
-    time_options = ["7 Days", "14 Days", "30 Days", "60 Days", "90 Days", "180 Days"]
-    selected_time = st.selectbox("Scan Last:", time_options, index=2)
-    days_ago = int(selected_time.split(" ")[0])
+    if platform == "YouTube Shorts":
+        time_options = ["7 Days", "14 Days", "30 Days", "60 Days", "90 Days", "180 Days"]
+        selected_time = st.selectbox("Scan Last:", time_options, index=2)
+        days_ago = int(selected_time.split(" ")[0])
+    else:
+        st.warning("📅 Date Filter Disabled (Data from CSV)")
+        days_ago = 9999 # Ignored for Sortfeed
 
 with c2:
     manual_baseline = st.number_input("Baseline Views (Avg):", min_value=1000, value=10000, step=1000)
@@ -389,16 +400,27 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
         client = gspread.authorize(creds)
         sheet = client.open(sheet_name).sheet1
 
-        # --- PHASE 1: SCRAPING & FILTERING ---
-        status_box = st.status("🔍 **Phase 1: Scouting & Filtering...**", expanded=True)
+        # --- PHASE 1: DATA LOADING ---
+        status_box = st.status("🔍 **Phase 1: Loading Data...**", expanded=True)
         with status_box:
+            
+            videos = []
+            scrape_stats = {}
             
             if platform == "YouTube Shorts":
                 channel_id = get_yt_channel_id(target_handle, YOUTUBE_API_KEY)
                 if not channel_id: st.stop()
                 videos, scrape_stats = get_yt_shorts(channel_id, YOUTUBE_API_KEY, days_ago)
             else:
-                videos, scrape_stats = get_ig_reels(target_handle, days_ago)
+                # INSTAGRAM / SORTFEED LOGIC
+                if not uploaded_sortfeed:
+                    st.error("Please upload a Sortfeed CSV file.")
+                    st.stop()
+                
+                # Reset file pointer if needed
+                uploaded_sortfeed.seek(0)
+                videos = load_sortfeed_data(uploaded_sortfeed)
+                scrape_stats = {"raw_fetched": len(videos)}
 
             if not videos:
                 status_box.update(label="❌ No videos found.", state="error")
@@ -426,26 +448,17 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
         st.subheader("📊 Data Inspector")
         
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Scraped", scrape_stats.get("raw_fetched", 0) if platform == "Instagram Reels" else scrape_stats.get("total_fetched", 0))
-        m2.metric("Filtered (Date)", scrape_stats.get("date_filtered", 0))
-        m3.metric("Filtered (Low Views)", len(skipped_low_views))
+        m1.metric("Total Loaded", len(videos))
+        m2.metric("Filtered (Low Views)", len(skipped_low_views))
+        m3.metric("Ignored (Date)", "N/A" if platform == "Instagram Reels" else scrape_stats.get("date_filtered", 0))
         m4.metric("🔥 Viral Hits", len(targets))
 
         with st.expander("📉 View Rejected / Skipped Data (Click to Expand)"):
-            tab_views, tab_date = st.tabs(["❌ Skipped (Low Views)", "❌ Skipped (Date/Errors)"])
-            
-            with tab_views:
-                if skipped_low_views:
-                    st.warning(f"These {len(skipped_low_views)} videos were skipped because they didn't hit {target_views:,} views.")
-                    st.dataframe(pd.DataFrame(skipped_low_views))
-                else:
-                    st.success("No videos skipped due to low views.")
-
-            with tab_date:
-                if platform == "Instagram Reels" and scrape_stats.get("rejected_log"):
-                    st.dataframe(pd.DataFrame(scrape_stats["rejected_log"]))
-                else:
-                    st.write("No specific date rejection logs available.")
+            if skipped_low_views:
+                st.warning(f"These {len(skipped_low_views)} videos were skipped because they didn't hit {target_views:,} views.")
+                st.dataframe(pd.DataFrame(skipped_low_views))
+            else:
+                st.success("No videos skipped due to low views.")
 
         if not targets:
             st.error("❌ No videos met your viral criteria. Try lowering the Multiplier or Baseline.")
@@ -502,14 +515,12 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
 
         if results_to_save:
             existing = sheet.get_all_values()
-            # [UPDATED] Headers: Removed 'Format'
             if not existing:
                 sheet.append_row(['Topic', 'Views', 'Multiplier', 'Date', 'URL', 'Hook', 'Transcript'])
             sheet.append_rows(results_to_save)
             st.success(f"🎉 Analysis Complete! Saved {len(results_to_save)} rows to Google Sheets.")
             
             with st.expander("📄 View Final Data"):
-                # [UPDATED] Columns: Removed 'Format'
                 st.dataframe(pd.DataFrame(results_to_save, columns=['Topic', 'Views', 'Multiplier', 'Date', 'URL', 'Hook', 'Transcript']))
 
     except Exception as e:
