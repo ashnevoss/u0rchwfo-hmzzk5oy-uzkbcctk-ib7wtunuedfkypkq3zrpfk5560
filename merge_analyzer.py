@@ -58,9 +58,7 @@ if uploaded_api_keys:
 # ================= CORE AI FUNCTIONS =================
 
 def translate_title_with_ai(title):
-    """
-    Fallback: Ensures the raw title is in English if transcript is missing.
-    """
+    """Fallback: Ensures the raw title is in English if transcript is missing."""
     if not title or title == "N/A":
         return "Unknown Title"
     if all(ord(c) < 128 for c in title.replace(" ", "")):
@@ -81,9 +79,7 @@ def translate_title_with_ai(title):
         return title
 
 def generate_title_from_transcript(transcript):
-    """
-    Generates a concise title based on the video content.
-    """
+    """Generates a concise title based on the video content."""
     if not transcript or len(transcript) < 20 or "N/A" in transcript: 
         return None  # Return None so we can fallback to raw title
     
@@ -109,29 +105,77 @@ def generate_title_from_transcript(transcript):
         return None
 
 def extract_hook_with_ai(transcript):
+    """
+    Master Hook Extractor.
+    Implements the 'First Connector Rule' (e.g., stop at 'ke baad').
+    """
     if not transcript or len(transcript) < 5 or transcript == "N/A": 
         return "N/A"
     
-    preview_text = transcript[:1000]
+    # 1. Limit Input Context
+    preview_text = transcript[:800]
+    
     prompt = (
-        "I will provide a video transcript below.\n"
-        "Identify the HOOK. The hook is the first 1 or 2 sentences that grab the viewer's attention.\n"
-        "Instructions:\n"
-        "1. Extract ONLY the hook text.\n"
-        "2. Do not add any explanation or labels.\n"
-        "3. Quote the text exactly from the transcript.\n\n"
+        "You are a Viral Script Engineer. Your job is to extract the 'Curiosity Setup' (The Hook) and strictly remove the 'Process' (The Recipe/Steps).\n\n"
+        "PHASE 1: ANALYZE THE STRUCTURE\n"
+        "Determine if the transcript is **Type A (Process)** or **Type B (Statement)**.\n\n"
+        "--- TYPE A: THE 'PROCESS' HOOK ---\n"
+        "(Starts with: 'Agar tum...', 'If you...', 'Kisi ne bataya...', 'Did you know...')\n"
+        "* **The Logic:** These hooks follow a specific formula: [Intro] + [If You] + [Subject] + [Action 1] + [Connector].\n"
+        "* **The Subject:** Identify the main object (e.g., 'Kaju', 'Mirchi', 'Paneer', 'Settings button').\n"
+        "* **The Cut Point:** You must STOP immediately after the **First Action** and its **Connector**.\n"
+        "* **The 'Ke Baad' Rule (Hindi):** If you see the phrase 'ke baad' (after), STOP exactly there.\n"
+        "* **The 'To' Rule:** NEVER reach the word 'to' (then). If you see 'to', you have gone too far.\n\n"
+        "**Type A Examples (Study the Cut Point):**\n"
+        "1.  *Input:* 'Kisi ne tumhe bataya agar tum **toote hue kaju** ko **garam pani mein soak karne ke baad** paste bana loge...'\n"
+        "    *Output:* 'Kisi ne tumhe bataya agar tum **toote hue kaju** ko **garam pani mein soak karne ke baad** (process...)'\n"
+        "    *(Reason: Stopped exactly at 'ke baad'. Deleted 'paste bana loge'.)*\n\n"
+        "2.  *Input:* 'Agar tum **badi wali mirchi** ka **stem katne ke baad** uske beej nikal loge...'\n"
+        "    *Output:* 'Agar tum **badi wali mirchi** ka **stem katne ke baad** (process...)'\n"
+        "    *(Reason: Stopped at 'ke baad'. Did not list step 2 'beej nikal loge'.)*\n\n"
+        "3.  *Input:* 'Agar tum **iPhone settings** mein **privacy par click karoge** to tumhe ek secret button milega.'\n"
+        "    *Output:* 'Agar tum **iPhone settings** mein **privacy par click karoge** (process...)'\n\n"
+        "--- TYPE B: THE 'STATEMENT' HOOK ---\n"
+        "(Starts with: A fact, a bold claim, or a question. No 'If' condition.)\n"
+        "* **The Logic:** Extract the first 1-2 sentences verbatim.\n"
+        "* **Example:** 'Stop using ChatGPT. Here is why.' -> Output: 'Stop using ChatGPT. Here is why.'\n\n"
+        "--- YOUR OUTPUT FORMAT ---\n"
+        "Return ONLY the extracted text followed by `(process...)` if it was Type A. Do not add labels.\n\n"
         f"Transcript:\n{preview_text}"
     )
+    
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini", 
             messages=[{"role": "user", "content": prompt}], 
-            temperature=0.2 
+            temperature=0.0, # Zero temp for robotic adherence to examples
+            max_tokens=85    
         )
         hook_text = response.choices[0].message.content.strip().replace('"', '')
+
+        # --- PYTHON SAFETY GUILLOTINE (Double Check) ---
+        
+        # 1. Force cut at "ke baad" if AI missed it but it exists
+        if "ke baad" in hook_text:
+            parts = hook_text.split("ke baad")
+            # We take the first part + "ke baad"
+            hook_text = parts[0] + "ke baad (process...)"
+            
+        # 2. Force cut at "to tum" / "toh tum" (The Result Triggers)
+        if "to tum" in hook_text:
+            hook_text = hook_text.split("to tum")[0].strip() + " (process...)"
+        if "toh tum" in hook_text:
+             hook_text = hook_text.split("toh tum")[0].strip() + " (process...)"
+
+        # 3. Clean up double tags
+        if "(process...)" in hook_text:
+            # ensure it only appears once at the end
+            hook_text = hook_text.replace("(process...)", "").strip() + " (process...)"
+
         return hook_text
     except Exception:
-        return transcript[:100] + "..."
+        # Fallback
+        return " ".join(transcript.split()[:10]) + "..."
 
 # ================= DATA FETCHING FUNCTIONS =================
 
@@ -315,7 +359,7 @@ def process_single_video(video, platform_type, baseline, enable_transcription):
     hook = "N/A"
 
     if len(transcript) > 20 and "N/A" not in transcript[:5]:
-        # 1. Extract Hook
+        # 1. Extract Hook (Using MASTER PROMPT)
         hook = extract_hook_with_ai(transcript)
         
         # 2. Generate Smart Title from Transcript
@@ -410,10 +454,28 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
         client = gspread.authorize(creds)
         sheet = client.open(sheet_name).sheet1
 
-        # --- PHASE 1: DATA LOADING ---
+        # --- PHASE 1: DATA LOADING & DUPLICATE CHECK ---
         status_box = st.status("🔍 **Phase 1: Loading Data...**", expanded=True)
         with status_box:
             
+            # 1. Fetch Existing Data (The Safety Feature)
+            st.write("🛡️ Checking Google Sheet for existing videos...")
+            existing_data = sheet.get_all_values()
+            
+            # HEADERS DEFINITION
+            new_headers = ['Title', 'Link', 'Format', 'Category', 'Subcategory', 'Views', 'Hook', 'Transcription', 'Made with Growingly', 'Is this Youtube']
+            
+            if not existing_data:
+                sheet.append_row(new_headers)
+                existing_urls = set()
+                st.write("   • Sheet is empty. Added headers.")
+            else:
+                # Column index 1 is 'Link' (2nd column). We use set for fast lookup.
+                # Only adding if row has enough columns to contain a link
+                existing_urls = set([row[1] for row in existing_data if len(row) > 1])
+                st.write(f"   • Found {len(existing_urls)} videos already in sheet.")
+
+            # 2. Fetch New Videos
             videos = []
             scrape_stats = {}
             
@@ -434,12 +496,18 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
                 status_box.update(label="❌ No videos found.", state="error")
                 st.stop()
 
-            targets = []
+            # 3. Filter Viral + Check Duplicates
+            viral_candidates = []
             skipped_low_views = []
+            duplicates_count = 0
             
             for v in videos:
                 if v['views'] >= target_views:
-                    targets.append(v)
+                    # DUPLICATE CHECK
+                    if v['url'] in existing_urls:
+                        duplicates_count += 1
+                    else:
+                        viral_candidates.append(v)
                 else:
                     skipped_low_views.append({
                         "title": v['title'],
@@ -448,17 +516,17 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
                         "shortfall": target_views - v['views']
                     })
 
-            status_box.update(label=f"✅ Found {len(targets)} Viral Hits. Proceeding...", state="complete", expanded=False)
+            status_box.update(label=f"✅ Found {len(viral_candidates)} New Viral Hits ({duplicates_count} skipped as duplicates).", state="complete", expanded=False)
 
         # --- DATA DASHBOARD ---
         st.divider()
         st.subheader("📊 Data Inspector")
         
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Loaded", len(videos))
-        m2.metric("Filtered (Low Views)", len(skipped_low_views))
-        m3.metric("Ignored (Date)", "N/A" if platform == "Instagram Reels" else scrape_stats.get("date_filtered", 0))
-        m4.metric("🔥 Viral Hits", len(targets))
+        m1.metric("Total Fetched", len(videos))
+        m2.metric("Low Views (Skipped)", len(skipped_low_views))
+        m3.metric("Already in Sheet (Skipped)", duplicates_count)
+        m4.metric("🔥 New to Process", len(viral_candidates))
 
         with st.expander("📉 View Rejected / Skipped Data (Click to Expand)"):
             if skipped_low_views:
@@ -467,71 +535,68 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
             else:
                 st.success("No videos skipped due to low views.")
 
-        if not targets:
-            st.error("❌ No videos met your viral criteria. Try lowering the Multiplier or Baseline.")
+        if not viral_candidates:
+            st.warning("⚠️ All viral videos found are already in your Google Sheet! Nothing new to process.")
             st.stop()
 
-        # --- PHASE 2: PROCESSING ---
+        # --- PHASE 2: PROCESSING & INCREMENTAL SAVE ---
         st.divider()
-        st.subheader(f"📝 Processing {len(targets)} Viral Videos")
+        st.subheader(f"📝 Processing {len(viral_candidates)} Videos (Saving Instantly)")
         
-        # --- MODIFICATION: CHECKBOX REMOVED, FORCED ON ---
         enable_ai_audio = True
 
         log_container = st.container()
-        results_to_save = []
-        
-        proc_stats = {"audio_transcribed": 0, "caption_used": 0, "failed": 0}
+        proc_stats = {"audio_transcribed": 0, "caption_used": 0, "failed": 0, "saved": 0}
         
         progress_bar = st.progress(0)
         
+        # We use ThreadPoolExecutor to process, but we handle saving one by one as they finish
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             future_to_video = {
                 executor.submit(process_single_video, vid, platform, manual_baseline, enable_ai_audio): vid 
-                for vid in targets
+                for vid in viral_candidates
             }
             
             completed = 0
             for future in concurrent.futures.as_completed(future_to_video):
-                row, log_text, p_stat = future.result()
-                
-                if p_stat["transcribed"]: proc_stats["audio_transcribed"] += 1
-                if p_stat["caption_fallback"]: proc_stats["caption_used"] += 1
-                if p_stat["failed"]: proc_stats["failed"] += 1
+                try:
+                    row, log_text, p_stat = future.result()
+                    
+                    if p_stat["transcribed"]: proc_stats["audio_transcribed"] += 1
+                    if p_stat["caption_fallback"]: proc_stats["caption_used"] += 1
+                    if p_stat["failed"]: proc_stats["failed"] += 1
 
-                with log_container:
-                    with st.expander(f"Processed: {future_to_video[future]['title'][:50]}...", expanded=False):
-                        st.markdown(log_text)
+                    with log_container:
+                        with st.expander(f"Processed: {future_to_video[future]['title'][:50]}...", expanded=False):
+                            st.markdown(log_text)
 
-                if row:
-                    results_to_save.append(row)
-                
+                    # --- CRITICAL UPDATE: IMMEDIATE SAVE ---
+                    if row:
+                        try:
+                            sheet.append_row(row)
+                            proc_stats["saved"] += 1
+                            # Sleep to prevent Google API "Too Many Requests" (Rate Limit: 60/min)
+                            time.sleep(1.5) 
+                        except Exception as save_error:
+                            st.error(f"❌ Failed to save row to Sheets: {save_error}")
+                    
+                except Exception as e:
+                    st.error(f"Error processing a video: {e}")
+
                 completed += 1
-                progress_bar.progress(completed / len(targets))
+                progress_bar.progress(completed / len(viral_candidates))
 
-        # --- SUMMARY & SAVE ---
+        # --- SUMMARY ---
         st.divider()
+        st.success(f"🎉 Analysis Complete! {proc_stats['saved']} new rows saved to Google Sheets.")
+        
         c_fin1, c_fin2 = st.columns(2)
         with c_fin1:
             st.caption("Processing Summary")
             st.write(f"🎙️ **Audio Transcribed:** {proc_stats['audio_transcribed']}")
             st.write(f"📝 **Caption Fallback:** {proc_stats['caption_used']}")
+            st.write(f"💾 **Saved to Sheet:** {proc_stats['saved']}")
             st.write(f"❌ **Failed:** {proc_stats['failed']}")
-
-        if results_to_save:
-            existing = sheet.get_all_values()
-            
-            # UPDATED HEADERS
-            new_headers = ['Title', 'Link', 'Format', 'Category', 'Subcategory', 'Views', 'Hook', 'Transcription', 'Made with Growingly', 'Is this Youtube']
-            
-            if not existing:
-                sheet.append_row(new_headers)
-            
-            sheet.append_rows(results_to_save)
-            st.success(f"🎉 Analysis Complete! Saved {len(results_to_save)} rows to Google Sheets.")
-            
-            with st.expander("📄 View Final Data"):
-                st.dataframe(pd.DataFrame(results_to_save, columns=new_headers))
 
     except Exception as e:
         st.error(f"Critical Error: {e}")
