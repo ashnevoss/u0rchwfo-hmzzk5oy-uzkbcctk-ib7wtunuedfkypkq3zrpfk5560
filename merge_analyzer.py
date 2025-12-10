@@ -193,45 +193,88 @@ def get_yt_channel_id(handle, api_key):
     return None
 
 def get_yt_shorts(channel_id, api_key, days_ago):
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_ago)
-    published_after = cutoff_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+    # Calculate cutoff date
+    if days_ago > 3650: # If "All Time" (approx > 10 years)
+        # Use a very old date or omit publishedAfter strictly if you want absolute history
+        published_after = "2005-01-01T00:00:00Z"
+    else:
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_ago)
+        published_after = cutoff_date.strftime('%Y-%m-%dT%H:%M:%SZ')
     
-    stats = {"total_fetched": 0, "date_filtered": 0, "valid": 0}
+    stats = {"total_fetched": 0, "valid": 0}
+    shorts = []
     
-    url = "https://youtube.googleapis.com/youtube/v3/search"
-    params = {
-        "key": api_key, "channelId": channel_id, "part": "snippet,id",
-        "order": "date", "publishedAfter": published_after,
-        "videoDuration": "short", "maxResults": 50, "type": "video"
+    # Base URL and Params
+    search_url = "https://youtube.googleapis.com/youtube/v3/search"
+    search_params = {
+        "key": api_key, 
+        "channelId": channel_id, 
+        "part": "snippet,id",
+        "order": "date", 
+        "publishedAfter": published_after,
+        "videoDuration": "short", 
+        "maxResults": 50, # Max allowed by API per page
+        "type": "video"
     }
-    try:
-        resp = requests.get(url, params=params)
-        data = resp.json()
-        items = data.get('items', [])
-        stats['total_fetched'] = len(items)
-        
-        video_ids = [item['id']['videoId'] for item in items if 'videoId' in item['id']]
-        
-        shorts = []
-        if video_ids:
-            details_url = "https://youtube.googleapis.com/youtube/v3/videos"
-            details_params = {"key": api_key, "id": ",".join(video_ids), "part": "statistics,snippet"}
-            details_resp = requests.get(details_url, params=details_params)
-            for v in details_resp.json().get('items', []):
-                views = int(v['statistics'].get('viewCount', 0))
-                shorts.append({
-                    "title": v['snippet']['title'],
-                    "views": views,
-                    "url": f"https://www.youtube.com/watch?v={v['id']}",
-                    "published": v['snippet']['publishedAt'][:10],
-                    "id": v['id']
-                })
-        
-        stats['valid'] = len(shorts)
-        return sorted(shorts, key=lambda x: x['views'], reverse=True), stats
-    except Exception as e:
-        st.error(f"YT API Error: {e}")
-        return [], stats
+    
+    next_page_token = None
+    
+    # --- PAGINATION LOOP ---
+    while True:
+        if next_page_token:
+            search_params["pageToken"] = next_page_token
+            
+        try:
+            # 1. Fetch Search Page (IDs)
+            resp = requests.get(search_url, params=search_params)
+            data = resp.json()
+            
+            items = data.get('items', [])
+            if not items:
+                break # No more items
+                
+            stats['total_fetched'] += len(items)
+            
+            # 2. Extract Video IDs from this batch
+            video_ids = [item['id']['videoId'] for item in items if 'videoId' in item['id']]
+            
+            # 3. Fetch View Counts (Details) for this batch
+            if video_ids:
+                details_url = "https://youtube.googleapis.com/youtube/v3/videos"
+                details_params = {
+                    "key": api_key, 
+                    "id": ",".join(video_ids), 
+                    "part": "statistics,snippet"
+                }
+                details_resp = requests.get(details_url, params=details_params)
+                details_data = details_resp.json().get('items', [])
+                
+                for v in details_data:
+                    views = int(v['statistics'].get('viewCount', 0))
+                    shorts.append({
+                        "title": v['snippet']['title'],
+                        "views": views,
+                        "url": f"https://www.youtube.com/watch?v={v['id']}",
+                        "published": v['snippet']['publishedAt'][:10],
+                        "id": v['id']
+                    })
+            
+            # 4. Check for Next Page
+            next_page_token = data.get("nextPageToken")
+            if not next_page_token:
+                break # Stop if no new token
+            
+            # Optional: Safety break to prevent eating 100% quota on massive channels
+            if len(shorts) >= 600: 
+                print("Hit safety limit of 600 videos (Search API Limit)")
+                break 
+
+        except Exception as e:
+            st.error(f"YT API Error: {e}")
+            break
+            
+    stats['valid'] = len(shorts)
+    return sorted(shorts, key=lambda x: x['views'], reverse=True), stats
 
 def load_sortfeed_data(uploaded_file):
     try:
@@ -425,9 +468,13 @@ c1, c2, c3 = st.columns(3)
 
 with c1:
     if platform == "YouTube Shorts":
-        time_options = ["7 Days", "14 Days", "30 Days", "60 Days", "90 Days", "180 Days"]
+        time_options = ["7 Days", "14 Days", "30 Days", "60 Days", "90 Days", "180 Days", "All Time"]
         selected_time = st.selectbox("Scan Last:", time_options, index=2)
-        days_ago = int(selected_time.split(" ")[0])
+        
+        if selected_time == "All Time":
+            days_ago = 5000 # ~13 years
+        else:
+            days_ago = int(selected_time.split(" ")[0])
     else:
         st.text_input("Scan Last:", value="Data from CSV", disabled=True, help="Date filtering is disabled because we are using uploaded CSV data.")
         days_ago = 9999 
