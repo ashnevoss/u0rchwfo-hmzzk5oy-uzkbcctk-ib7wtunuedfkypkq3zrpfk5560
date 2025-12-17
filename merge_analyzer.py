@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 import concurrent.futures
 import re
+import isodate  # Added for parsing YouTube duration
 
 # ================= CONFIGURATION =================
 # 1. TRANSCRIBERS (Using Apify Actors)
@@ -81,9 +82,9 @@ def translate_title_with_ai(title):
 def generate_title_from_transcript(transcript):
     """Generates a concise title based on the video content."""
     if not transcript or len(transcript) < 20 or "N/A" in transcript: 
-        return None  # Return None so we can fallback to raw title
+        return None 
     
-    preview_text = transcript[:1500] # Give AI enough context
+    preview_text = transcript[:1500]
     
     prompt = (
         "Read the following video transcript and generate a CONCISE English title (3-6 words).\n"
@@ -105,14 +106,10 @@ def generate_title_from_transcript(transcript):
         return None
 
 def extract_hook_with_ai(transcript):
-    """
-    Master Hook Extractor.
-    Implements the 'First Connector Rule' (e.g., stop at 'ke baad').
-    """
+    """Master Hook Extractor."""
     if not transcript or len(transcript) < 5 or transcript == "N/A": 
         return "N/A"
     
-    # 1. Limit Input Context
     preview_text = transcript[:800]
     
     prompt = (
@@ -148,108 +145,150 @@ def extract_hook_with_ai(transcript):
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini", 
             messages=[{"role": "user", "content": prompt}], 
-            temperature=0.0, # Zero temp for robotic adherence to examples
+            temperature=0.0,
             max_tokens=85    
         )
         hook_text = response.choices[0].message.content.strip().replace('"', '')
 
-        # --- PYTHON SAFETY GUILLOTINE (Double Check) ---
-        
-        # 1. Force cut at "ke baad" if AI missed it but it exists
+        # --- PYTHON SAFETY GUILLOTINE ---
         if "ke baad" in hook_text:
             parts = hook_text.split("ke baad")
-            # We take the first part + "ke baad"
             hook_text = parts[0] + "ke baad (process...)"
-            
-        # 2. Force cut at "to tum" / "toh tum" (The Result Triggers)
         if "to tum" in hook_text:
             hook_text = hook_text.split("to tum")[0].strip() + " (process...)"
         if "toh tum" in hook_text:
              hook_text = hook_text.split("toh tum")[0].strip() + " (process...)"
-
-        # 3. Clean up double tags
         if "(process...)" in hook_text:
-            # ensure it only appears once at the end
             hook_text = hook_text.replace("(process...)", "").strip() + " (process...)"
 
         return hook_text
     except Exception:
-        # Fallback
         return " ".join(transcript.split()[:10]) + "..."
 
 # ================= DATA FETCHING FUNCTIONS =================
 
-def get_yt_channel_id(handle, api_key):
+def is_actually_shorts(video_id):
+    """
+    The 'DNA Test': Checks if a video exists on the /shorts/ shelf.
+    This filters out short landscape videos.
+    """
+    url = f"https://www.youtube.com/shorts/{video_id}"
+    try:
+        # We use HEAD to save bandwidth. allow_redirects=False is key.
+        # If it's a short, it stays 200. If not, it redirects 303 to /watch.
+        r = requests.head(url, allow_redirects=False, timeout=5)
+        if r.status_code == 200:
+            return True
+        return False
+    except:
+        # If network error, assume False to be safe
+        return False
+
+def get_yt_channel_upload_playlist(handle, api_key):
     url = "https://youtube.googleapis.com/youtube/v3/channels"
     if not handle.startswith("@"): handle = "@" + handle
-    params = {"key": api_key, "forHandle": handle, "part": "id"}
+    params = {"key": api_key, "forHandle": handle, "part": "contentDetails"}
     try:
         resp = requests.get(url, params=params)
         data = resp.json()
         if "items" in data and data["items"]:
-            return data["items"][0]["id"]
-    except Exception:
-        pass
+            return data["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    except Exception as e:
+        st.error(f"Error fetching channel details: {e}")
     return None
 
-def get_yt_shorts(channel_id, api_key, days_ago):
+def get_yt_shorts(playlist_id, api_key, days_ago):
+    """
+    Fetches videos from Uploads playlist.
+    FILTERS: 
+    1. Duration (Smart Limit based on Date)
+    2. Shorts Shelf Check (The DNA Test)
+    """
+    shorts = []
+    stats = {"total_fetched": 0, "valid": 0}
+    
     # Calculate cutoff date
-    if days_ago > 3650: # If "All Time" (approx > 10 years)
-        # Use a very old date or omit publishedAfter strictly if you want absolute history
-        published_after = "2005-01-01T00:00:00Z"
+    if days_ago > 3650:
+        cutoff_date = datetime(2005, 1, 1, tzinfo=timezone.utc)
     else:
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_ago)
-        published_after = cutoff_date.strftime('%Y-%m-%dT%H:%M:%SZ')
-    
-    stats = {"total_fetched": 0, "valid": 0}
-    shorts = []
-    
-    # Base URL and Params
-    search_url = "https://youtube.googleapis.com/youtube/v3/search"
-    search_params = {
-        "key": api_key, 
-        "channelId": channel_id, 
-        "part": "snippet,id",
-        "order": "date", 
-        "publishedAfter": published_after,
-        "videoDuration": "short", 
-        "maxResults": 50, # Max allowed by API per page
-        "type": "video"
+
+    base_url = "https://youtube.googleapis.com/youtube/v3/playlistItems"
+    params = {
+        "key": api_key,
+        "playlistId": playlist_id,
+        "part": "snippet,contentDetails",
+        "maxResults": 50
     }
     
+    video_ids_batch = []
     next_page_token = None
     
-    # --- PAGINATION LOOP ---
+    st.write("🔄 Scanning Channel History...")
+    progress_bar = st.progress(0)
+    
+    shorts_change_date = datetime(2024, 10, 15, tzinfo=timezone.utc)
+
     while True:
         if next_page_token:
-            search_params["pageToken"] = next_page_token
+            params["pageToken"] = next_page_token
             
         try:
-            # 1. Fetch Search Page (IDs)
-            resp = requests.get(search_url, params=search_params)
+            resp = requests.get(base_url, params=params)
             data = resp.json()
-            
             items = data.get('items', [])
-            if not items:
-                break # No more items
+            
+            if not items: break
                 
-            stats['total_fetched'] += len(items)
+            current_batch_ids = []
+            for item in items:
+                vid_date_str = item['snippet']['publishedAt']
+                vid_date = datetime.strptime(vid_date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                
+                if days_ago < 3650 and vid_date < cutoff_date:
+                    next_page_token = None
+                    break
+                
+                current_batch_ids.append(item['contentDetails']['videoId'])
+
+            video_ids_batch.extend(current_batch_ids)
             
-            # 2. Extract Video IDs from this batch
-            video_ids = [item['id']['videoId'] for item in items if 'videoId' in item['id']]
-            
-            # 3. Fetch View Counts (Details) for this batch
-            if video_ids:
+            # Process batch
+            if len(video_ids_batch) >= 50 or not data.get("nextPageToken") or (days_ago < 3650 and vid_date < cutoff_date):
+                
                 details_url = "https://youtube.googleapis.com/youtube/v3/videos"
                 details_params = {
-                    "key": api_key, 
-                    "id": ",".join(video_ids), 
-                    "part": "statistics,snippet"
+                    "key": api_key,
+                    "id": ",".join(video_ids_batch),
+                    "part": "contentDetails,statistics,snippet"
                 }
-                details_resp = requests.get(details_url, params=details_params)
-                details_data = details_resp.json().get('items', [])
+                d_resp = requests.get(details_url, params=details_params)
+                d_items = d_resp.json().get('items', [])
                 
-                for v in details_data:
+                # --- VALIDATION LOOP ---
+                for v in d_items:
+                    # 1. Parse Duration
+                    duration_str = v['contentDetails']['duration']
+                    try:
+                        duration_obj = isodate.parse_duration(duration_str)
+                        seconds = duration_obj.total_seconds()
+                    except:
+                        continue 
+                    
+                    # 2. Smart Duration Check (Date aware)
+                    vid_date_str = v['snippet']['publishedAt']
+                    vid_date = datetime.strptime(vid_date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    
+                    limit = 181 if vid_date >= shorts_change_date else 61
+                    if seconds > limit:
+                         continue # Too long
+
+                    # 3. THE DNA TEST (Check if it's actually a Short)
+                    # We only do this check if it passes duration, to save requests
+                    if not is_actually_shorts(v['id']):
+                        continue # It was a short landscape video!
+
+                    # 4. Add to list
                     views = int(v['statistics'].get('viewCount', 0))
                     shorts.append({
                         "title": v['snippet']['title'],
@@ -258,22 +297,21 @@ def get_yt_shorts(channel_id, api_key, days_ago):
                         "published": v['snippet']['publishedAt'][:10],
                         "id": v['id']
                     })
+                
+                video_ids_batch = [] 
+
+            stats['total_fetched'] += len(items)
             
-            # 4. Check for Next Page
             next_page_token = data.get("nextPageToken")
             if not next_page_token:
-                break # Stop if no new token
-            
-            # Optional: Safety break to prevent eating 100% quota on massive channels
-            if len(shorts) >= 600: 
-                print("Hit safety limit of 600 videos (Search API Limit)")
-                break 
-
+                break
+                
         except Exception as e:
-            st.error(f"YT API Error: {e}")
+            st.error(f"API Error: {e}")
             break
             
     stats['valid'] = len(shorts)
+    progress_bar.empty()
     return sorted(shorts, key=lambda x: x['views'], reverse=True), stats
 
 def load_sortfeed_data(uploaded_file):
@@ -281,7 +319,7 @@ def load_sortfeed_data(uploaded_file):
         df = pd.read_csv(uploaded_file)
         required_cols = ['Reel', 'Views']
         if not all(col in df.columns for col in required_cols):
-             st.error(f"❌ CSV format error. Missing required columns (Reel, Views). Found: {df.columns.tolist()}")
+             st.error(f"❌ CSV format error. Missing required columns (Reel, Views).")
              return []
         
         videos = []
@@ -304,8 +342,6 @@ def load_sortfeed_data(uploaded_file):
                 "published": "N/A",
                 "id": short_code
             })
-        
-        st.success(f"✅ Successfully loaded {len(videos)} videos from Sortfeed CSV.")
         return sorted(videos, key=lambda x: x['views'], reverse=True)
 
     except Exception as e:
@@ -402,38 +438,32 @@ def process_single_video(video, platform_type, baseline, enable_transcription):
     hook = "N/A"
 
     if len(transcript) > 20 and "N/A" not in transcript[:5]:
-        # 1. Extract Hook (Using MASTER PROMPT)
         hook = extract_hook_with_ai(transcript)
-        
-        # 2. Generate Smart Title from Transcript
         generated_title = generate_title_from_transcript(transcript)
         
         if generated_title:
             final_title = generated_title
             calc_log.append(f"   • 🧠 **AI Title:** {final_title}")
         else:
-            # Fallback to translation if AI title fails
             final_title = translate_title_with_ai(video['title'])
             calc_log.append(f"   • ⚠️ **AI Title Failed:** Using Translated Raw Title")
     else:
-        # Fallback if no transcript
         final_title = translate_title_with_ai(video['title'])
     
     final_transcript = f"[CAPTION ONLY] {transcript}" if is_caption_fallback else transcript
     
-    # --- CONSTRUCT ROW (UPDATED FORMAT) ---
-    # Title, Link, Format, Category, Subcategory, Views, Hook, Transcription, Made with growingly, Is this Youtube
+    is_youtube = "Yes" if platform_type == "YouTube Shorts" else ""
+
     row = [
-        final_title,                # Title
-        video['url'],               # Link
-        "",                         # Format
-        "",                         # Category (Empty)
-        "",                         # Subcategory (Empty)
-        video['views'],             # Views
-        hook,                       # Hook
-        final_transcript[:40000],   # Transcription
-        "",                         # Made with Growingly (Empty)
-        ""                          # Is this Youtube (Empty)
+        final_title,                # 1. Title
+        video['url'],               # 2. Link
+        "",                         # 3. Format
+        "",                         # 4. Subcategory
+        video['views'],             # 5. Views
+        hook,                       # 6. Hooks
+        final_transcript[:40000],   # 7. Transcription
+        "",                         # 8. Made with Growingli
+        is_youtube                  # 9. Is this youtube
     ]
     
     return row, "\n".join(calc_log), result_stats
@@ -442,7 +472,7 @@ def process_single_video(video, platform_type, baseline, enable_transcription):
 
 if platform == "YouTube Shorts":
     st.title("🎥 YouTube Viral Analyzer")
-    st.info("Uses YouTube API (Free/Cheap) for discovery.")
+    st.info("Uses DNA Test to ensure 100% Shorts Accuracy.")
     handle_label = "YouTube Handle"
     default_handle = "@BusyFunda"
     
@@ -453,9 +483,7 @@ if platform == "YouTube Shorts":
         sheet_name = st.text_input("Google Sheet Name", value="ProjectO1")
 
 else:
-    st.title("📸 Instagram Viral Analyzer (Sortfeed Edition)")
-    st.info("Upload your Sortfeed CSV export below to save on scraping costs.")
-    
+    st.title("📸 Instagram Viral Analyzer")
     col1, col2 = st.columns(2)
     with col1:
         uploaded_sortfeed = st.file_uploader("Upload Sortfeed CSV", type=["csv"])
@@ -472,11 +500,11 @@ with c1:
         selected_time = st.selectbox("Scan Last:", time_options, index=2)
         
         if selected_time == "All Time":
-            days_ago = 5000 # ~13 years
+            days_ago = 5000 
         else:
             days_ago = int(selected_time.split(" ")[0])
     else:
-        st.text_input("Scan Last:", value="Data from CSV", disabled=True, help="Date filtering is disabled because we are using uploaded CSV data.")
+        st.text_input("Scan Last:", value="Data from CSV", disabled=True)
         days_ago = 9999 
 
 with c2:
@@ -505,39 +533,32 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
         status_box = st.status("🔍 **Phase 1: Loading Data...**", expanded=True)
         with status_box:
             
-            # 1. Fetch Existing Data (The Safety Feature)
             st.write("🛡️ Checking Google Sheet for existing videos...")
             existing_data = sheet.get_all_values()
-            
-            # HEADERS DEFINITION
-            new_headers = ['Title', 'Link', 'Format', 'Category', 'Subcategory', 'Views', 'Hook', 'Transcription', 'Made with Growingly', 'Is this Youtube']
+            new_headers = ['Title', 'Link', 'Format', 'Subcategory', 'views', 'Hooks', 'Transcription', 'Made with Growingli', 'Is this youtube']
             
             if not existing_data:
                 sheet.append_row(new_headers)
                 existing_urls = set()
                 st.write("   • Sheet is empty. Added headers.")
             else:
-                # Column index 1 is 'Link' (2nd column). We use set for fast lookup.
-                # Only adding if row has enough columns to contain a link
                 existing_urls = set([row[1] for row in existing_data if len(row) > 1])
                 st.write(f"   • Found {len(existing_urls)} videos already in sheet.")
 
             # 2. Fetch New Videos
             videos = []
-            scrape_stats = {}
-            
             if platform == "YouTube Shorts":
-                channel_id = get_yt_channel_id(target_handle, YOUTUBE_API_KEY)
-                if not channel_id: st.stop()
-                videos, scrape_stats = get_yt_shorts(channel_id, YOUTUBE_API_KEY, days_ago)
+                playlist_id = get_yt_channel_upload_playlist(target_handle, YOUTUBE_API_KEY)
+                if not playlist_id: 
+                    st.error("Could not find uploads playlist.")
+                    st.stop()
+                videos, _ = get_yt_shorts(playlist_id, YOUTUBE_API_KEY, days_ago)
             else:
                 if not uploaded_sortfeed:
                     st.error("Please upload a Sortfeed CSV file.")
                     st.stop()
-                
                 uploaded_sortfeed.seek(0)
                 videos = load_sortfeed_data(uploaded_sortfeed)
-                scrape_stats = {"raw_fetched": len(videos)}
 
             if not videos:
                 status_box.update(label="❌ No videos found.", state="error")
@@ -545,59 +566,30 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
 
             # 3. Filter Viral + Check Duplicates
             viral_candidates = []
-            skipped_low_views = []
             duplicates_count = 0
             
             for v in videos:
                 if v['views'] >= target_views:
-                    # DUPLICATE CHECK
                     if v['url'] in existing_urls:
                         duplicates_count += 1
                     else:
                         viral_candidates.append(v)
-                else:
-                    skipped_low_views.append({
-                        "title": v['title'],
-                        "views": v['views'],
-                        "date": v['published'],
-                        "shortfall": target_views - v['views']
-                    })
-
+            
             status_box.update(label=f"✅ Found {len(viral_candidates)} New Viral Hits ({duplicates_count} skipped as duplicates).", state="complete", expanded=False)
 
-        # --- DATA DASHBOARD ---
-        st.divider()
-        st.subheader("📊 Data Inspector")
-        
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Fetched", len(videos))
-        m2.metric("Low Views (Skipped)", len(skipped_low_views))
-        m3.metric("Already in Sheet (Skipped)", duplicates_count)
-        m4.metric("🔥 New to Process", len(viral_candidates))
-
-        with st.expander("📉 View Rejected / Skipped Data (Click to Expand)"):
-            if skipped_low_views:
-                st.warning(f"These {len(skipped_low_views)} videos were skipped because they didn't hit {target_views:,} views.")
-                st.dataframe(pd.DataFrame(skipped_low_views))
-            else:
-                st.success("No videos skipped due to low views.")
-
-        if not viral_candidates:
-            st.warning("⚠️ All viral videos found are already in your Google Sheet! Nothing new to process.")
-            st.stop()
-
         # --- PHASE 2: PROCESSING & INCREMENTAL SAVE ---
+        if not viral_candidates:
+            st.warning("⚠️ No new viral videos found to process.")
+            st.stop()
+            
         st.divider()
-        st.subheader(f"📝 Processing {len(viral_candidates)} Videos (Saving Instantly)")
+        st.subheader(f"📝 Processing {len(viral_candidates)} Videos")
         
         enable_ai_audio = True
-
         log_container = st.container()
-        proc_stats = {"audio_transcribed": 0, "caption_used": 0, "failed": 0, "saved": 0}
-        
+        proc_stats = {"saved": 0}
         progress_bar = st.progress(0)
         
-        # We use ThreadPoolExecutor to process, but we handle saving one by one as they finish
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             future_to_video = {
                 executor.submit(process_single_video, vid, platform, manual_baseline, enable_ai_audio): vid 
@@ -608,42 +600,19 @@ if st.button("🚀 Start Deep Analysis", type="primary"):
             for future in concurrent.futures.as_completed(future_to_video):
                 try:
                     row, log_text, p_stat = future.result()
-                    
-                    if p_stat["transcribed"]: proc_stats["audio_transcribed"] += 1
-                    if p_stat["caption_fallback"]: proc_stats["caption_used"] += 1
-                    if p_stat["failed"]: proc_stats["failed"] += 1
-
                     with log_container:
                         with st.expander(f"Processed: {future_to_video[future]['title'][:50]}...", expanded=False):
                             st.markdown(log_text)
-
-                    # --- CRITICAL UPDATE: IMMEDIATE SAVE ---
                     if row:
-                        try:
-                            sheet.append_row(row)
-                            proc_stats["saved"] += 1
-                            # Sleep to prevent Google API "Too Many Requests" (Rate Limit: 60/min)
-                            time.sleep(1.5) 
-                        except Exception as save_error:
-                            st.error(f"❌ Failed to save row to Sheets: {save_error}")
-                    
+                        sheet.append_row(row)
+                        proc_stats["saved"] += 1
+                        time.sleep(1.5)
                 except Exception as e:
-                    st.error(f"Error processing a video: {e}")
-
+                    st.error(f"Error: {e}")
                 completed += 1
                 progress_bar.progress(completed / len(viral_candidates))
 
-        # --- SUMMARY ---
-        st.divider()
-        st.success(f"🎉 Analysis Complete! {proc_stats['saved']} new rows saved to Google Sheets.")
+        st.success(f"🎉 Analysis Complete! {proc_stats['saved']} new rows saved.")
         
-        c_fin1, c_fin2 = st.columns(2)
-        with c_fin1:
-            st.caption("Processing Summary")
-            st.write(f"🎙️ **Audio Transcribed:** {proc_stats['audio_transcribed']}")
-            st.write(f"📝 **Caption Fallback:** {proc_stats['caption_used']}")
-            st.write(f"💾 **Saved to Sheet:** {proc_stats['saved']}")
-            st.write(f"❌ **Failed:** {proc_stats['failed']}")
-
     except Exception as e:
         st.error(f"Critical Error: {e}")
