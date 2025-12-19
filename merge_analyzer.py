@@ -15,7 +15,7 @@ import isodate # REQUIRED: pip install isodate
 # ================= CONFIGURATION =================
 # 1. TRANSCRIBERS (Using Apify Actors)
 IG_TRANSCRIBER_ACTOR = "QDd59HBnZaQ89Rghe" 
-YT_TRANSCRIBER_ACTOR = "f3uGksrII7QnHi8oD"
+YT_TRANSCRIBER_ACTOR = "bbqmsPr0r519A0ZaV"
 
 # 2. LANGUAGE SETTINGS
 YT_LANGUAGE_PREFERENCE = "en" 
